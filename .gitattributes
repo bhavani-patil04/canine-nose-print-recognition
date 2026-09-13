@@ -1,1 +1,7 @@
 pet_biometric_clean/images/*.jpg filter=lfs diff=lfs merge=lfs -text
+pet_biometric_challenge_2022/**/*.jpg filter=lfs diff=lfs merge=lfs -text
+pet_biometric_available/**/*.jpg filter=lfs diff=lfs merge=lfs -text
+pet_biometric_clean/**/*.jpg filter=lfs diff=lfs merge=lfs -text
+pet_biometric_challenge_2022/train/images/*.jpg filter=lfs diff=lfs merge=lfs -text
+pet_biometric_challenge_2022/validation/images/*.jpg filter=lfs diff=lfs merge=lfs -text
+pet_biometric_available/images/*.jpg filter=lfs diff=lfs merge=lfs -text

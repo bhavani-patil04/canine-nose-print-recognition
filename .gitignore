@@ -7,10 +7,6 @@ __pycache__/
 
 # Datasets
 data/
-DogFLW/
-pet_biometric_challenge_2022/
-pet_biometric_available/
-pet_biometric_clean/
 
 # Generated model/features
 models/
