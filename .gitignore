@@ -22,3 +22,7 @@ features/
 # Ignore local QA outputs and large raw/training datasets
 QA_Testing_Suite/outputs/
 image_enhancement/dataset/
+
+# Ignore QA outputs and large raw/training datasets anywhere in the repo
+**/image_enhancement/dataset/
+QA_Testing_Suite/outputs/
