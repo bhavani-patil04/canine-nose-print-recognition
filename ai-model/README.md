@@ -241,7 +241,3 @@ ai-model/
 │
 ├── requirements.txt
 └── README.md
-
-## **License**
-
-This project is part of the **Living Bridges Stray Dog Tracking and Identification System**.
