@@ -18,3 +18,7 @@ features/
 
 # Environment variables
 .env
+
+# Ignore local QA outputs and large raw/training datasets
+QA_Testing_Suite/outputs/
+image_enhancement/dataset/
