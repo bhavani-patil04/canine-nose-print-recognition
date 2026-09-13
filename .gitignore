@@ -10,7 +10,6 @@ data/
 
 # Generated model/features
 models/
-features/
 
 # Environment variables
 .env
