@@ -1,4 +1,4 @@
-Living Bridges - AI Model
+## Living Bridges - AI Model
 
 The AI Model component of the Living Bridges Stray Dog Tracking and Identification System handles canine nose-print feature extraction and similarity-based recognition.
 
@@ -242,6 +242,6 @@ ai-model/
 ├── requirements.txt
 └── README.md
 
- License
+## **License**
 
 This project is part of the **Living Bridges Stray Dog Tracking and Identification System**.
