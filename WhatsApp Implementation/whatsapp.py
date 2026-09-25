@@ -1,380 +1,915 @@
-import sqlite3
-import uuid
-import os
-import json
-import logging
-import httpx
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, PlainTextResponse, HTMLResponse
+from fastapi import FastAPI, Request, Query
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
-
-# ========================================================
-# ENVIRONMENT & META WHATSAPP CLOUD API CONFIGURATION
-# ========================================================
-
-def load_env_file(filepath=".env"):
-    """Reads .env file and sets environment variables."""
-    env_path = filepath if os.path.isabs(filepath) else os.path.join(os.path.dirname(os.path.abspath(__file__)), filepath)
-    if os.path.exists(env_path):
-        with open(env_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    k, v = line.split("=", 1)
-                    os.environ[k.strip()] = v.strip().strip('"').strip("'")
-
-def get_meta_config():
-    load_env_file(".env")
-    return {
-        "token": os.environ.get("META_ACCESS_TOKEN", ""),
-        "phone_id": os.environ.get("META_PHONE_NUMBER_ID", ""),
-        "verify_token": os.environ.get("META_VERIFY_TOKEN", "living_bridges_secret_123"),
-        "version": os.environ.get("META_API_VERSION", "v20.0")
-    }
-
-load_env_file(".env")
+import sqlite3
+import os
+import uuid
+import qrcode
+import requests
 
 
-app = FastAPI(title="Living Bridges Dog Tracker API")
+# ============================================================
+# APP
+# ============================================================
+
+app = FastAPI(title="Living Bridges - WhatsApp Dog Registration")
 
 
+# ============================================================
+# META WHATSAPP SETTINGS
+# ============================================================
 
-# ========================================================
-# DATABASE CONFIGURATION & INITIALIZATION
-# ========================================================
+VERIFY_TOKEN = "livingbridges123"
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dogs.db")
+# IMPORTANT:
+# Paste your Meta-generated access token here.
+# DO NOT SHARE THIS TOKEN WITH ANYONE.
+WHATSAPP_ACCESS_TOKEN = "EAAewbDdO3D8BSvyxjl00kjRZCnPZCiJxCD8fGUvMBXsYWZAzLXF2CmBOhTqnJXZANvg9ZBe56ZC2HGSb9M2mMf2sifvrNKZB1cKfyQm841xPm84JuUcAc2iRxN678KalRKkkk092EPNlECjuZAs1WG39LkQZBBR2PXMPE3AXIb4LvRnSb62jaEeWWbuyFYpexMzpZAmo0DlW0amju7nV5rQvYNIhq8rCnCZCqFuGGPbY32BMNkm1bcZCcVliyJUIPFExIhbSisaGqDZCxrRWFPr4nZBfG6aWNVD5kjEcO0xAZDZD"
+
+# Your Meta WhatsApp Test Phone Number ID
+PHONE_NUMBER_ID = "1249526271585172"
+
+# Meta Graph API version
+GRAPH_API_VERSION = "v20.0"
+
+WHATSAPP_API_URL = (
+    f"https://graph.facebook.com/"
+    f"{GRAPH_API_VERSION}/"
+    f"{PHONE_NUMBER_ID}/messages"
+)
+
+
+# ============================================================
+# WEBHOOK VERIFICATION
+# ============================================================
+
+@app.get("/webhook", response_class=PlainTextResponse)
+def verify_webhook(
+    hub_mode: str = Query(None, alias="hub.mode"),
+    hub_verify_token: str = Query(None, alias="hub.verify_token"),
+    hub_challenge: str = Query(None, alias="hub.challenge")
+):
+
+    if (
+        hub_mode == "subscribe"
+        and hub_verify_token == VERIFY_TOKEN
+        and hub_challenge
+    ):
+        return hub_challenge
+
+    return "Verification failed"
+
+
+# ============================================================
+# DATABASE
+# ============================================================
+
+DB_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "dogs.db"
+)
+
+print("Database path:", DB_PATH)
+
 
 def get_connection():
-    """Returns a connection to the SQLite database."""
-    conn = sqlite3.connect(DB_PATH)
-    return conn
 
-def init_db():
-    """Initializes the database schema if it does not exist."""
+    return sqlite3.connect(DB_PATH)
+
+
+def create_database():
+
     conn = get_connection()
     cursor = conn.cursor()
+
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS dogs (
             dog_id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            area TEXT NOT NULL,
-            medical_details TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            name TEXT,
+            area TEXT,
+            medical_details TEXT
         )
     """)
+
     conn.commit()
     conn.close()
 
-# Initialize DB on module import
-init_db()
 
-# ========================================================
-# STATE MANAGEMENT
-# ========================================================
+create_database()
+
+
+# ============================================================
+# TEMPORARY USER STATES
+# ============================================================
 
 user_states = {}
+
 user_registration = {}
+
 user_update_dogs = {}
 
-# ========================================================
-# HELPER FUNCTIONS
-# ========================================================
 
-def main_menu() -> str:
-    """Returns the formatted main menu string."""
-    return (
-        "🐾 *Living Bridges Dog Tracker*\n\n"
-        "1️⃣ Register a new dog\n"
-        "2️⃣ Update existing dog medical details\n"
-        "3️⃣ View all registered dogs\n\n"
-        "Please reply with *1*, *2*, or *3*."
+# ============================================================
+# REQUEST MODEL FOR LOCAL TESTING
+# ============================================================
+
+class WhatsAppMessage(BaseModel):
+
+    user_id: str
+
+    message_text: str = ""
+
+    message_type: str = "text"
+
+
+# ============================================================
+# BASIC ROUTES
+# ============================================================
+
+@app.get("/")
+def home():
+
+    return {
+        "message": "Living Bridges WhatsApp Integration API is running"
+    }
+
+
+# ============================================================
+# GET ALL DOGS
+# ============================================================
+
+@app.get("/dogs")
+def get_all_dogs():
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT dog_id, name, area, medical_details
+        FROM dogs
+    """)
+
+    rows = cursor.fetchall()
+
+    conn.close()
+
+    dogs = []
+
+    for row in rows:
+
+        dogs.append({
+            "dog_id": row[0],
+            "name": row[1],
+            "area": row[2],
+            "medical_details": row[3]
+        })
+
+    return dogs
+
+
+# ============================================================
+# GET ONE DOG
+# ============================================================
+
+@app.get("/dog/{dog_id}")
+def get_dog(dog_id: str):
+
+    dog_id = dog_id.strip().upper()
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT dog_id, name, area, medical_details
+        FROM dogs
+        WHERE dog_id = ?
+    """, (dog_id,))
+
+    row = cursor.fetchone()
+
+    conn.close()
+
+    if row is None:
+
+        return {
+            "error": "Dog not found"
+        }
+
+    return {
+        "dog_id": row[0],
+        "name": row[1],
+        "area": row[2],
+        "medical_details": row[3]
+    }
+
+
+# ============================================================
+# QR CODE GENERATOR
+# ============================================================
+
+def generate_qr(dog_id: str):
+
+    qr_folder = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "qr_codes"
     )
 
-def valid_medical_details(text: str) -> bool:
-    """Validates that medical details include vaccination or sterilization info."""
-    if not text:
+    os.makedirs(qr_folder, exist_ok=True)
+
+    qr = qrcode.QRCode(
+        version=1,
+        box_size=10,
+        border=4
+    )
+
+    qr.add_data(dog_id)
+
+    qr.make(fit=True)
+
+    img = qr.make_image()
+
+    file_path = os.path.join(
+        qr_folder,
+        f"{dog_id}.png"
+    )
+
+    img.save(file_path)
+
+    return file_path
+
+
+# ============================================================
+# MAIN MENU
+# ============================================================
+
+def main_menu():
+
+    return (
+        "🐶 *Living Bridges*\n\n"
+        "Please choose an option:\n\n"
+        "1️⃣ Identify an Unknown Dog\n"
+        "2️⃣ Register a Known New Dog\n"
+        "3️⃣ Update Existing Dog Record\n\n"
+        "Reply with 1, 2, or 3."
+    )
+
+
+# ============================================================
+# CONFIRMATION MESSAGE
+# ============================================================
+
+def confirmation_message(user_id: str):
+
+    data = user_registration[user_id]
+
+    return (
+        "📋 *Please confirm the dog's details*\n\n"
+
+        f"🐶 Name: {data['name']}\n"
+        f"📍 Area: {data['area']}\n"
+        f"🏥 Medical Details: {data['medical_details']}\n\n"
+
+        "Choose an option:\n\n"
+
+        "1️⃣ Confirm & Register\n"
+        "2️⃣ Change Name\n"
+        "3️⃣ Change Area\n"
+        "4️⃣ Change Medical Details\n"
+        "5️⃣ Start Again"
+    )
+
+
+# ============================================================
+# VALIDATE MEDICAL DETAILS
+# ============================================================
+
+def valid_medical_details(text: str):
+
+    text_lower = text.lower()
+
+    if (
+        "vaccination" not in text_lower
+        and "sterilization" not in text_lower
+    ):
         return False
-    lower = text.lower()
-    return "vaccin" in lower or "steril" in lower
 
-def confirmation_message(user_id: str) -> str:
-    """Constructs the registration confirmation message for review."""
-    data = user_registration.get(user_id, {})
-    name = data.get("name", "N/A")
-    area = data.get("area", "N/A")
-    medical = data.get("medical_details", "N/A")
+    return True
 
-    return (
-        "📋 *Registration Summary:*\n\n"
-        f"🐶 *Name:* {name}\n"
-        f"📍 *Area:* {area}\n"
-        f"🏥 *Medical Details:*\n{medical}\n\n"
-        "Reply with:\n"
-        "• *1* or *Confirm* to save\n"
-        "• *2* or *Change Name* to edit name\n"
-        "• *3* or *Change Area* to edit area\n"
-        "• *4* or *Change Medical* to edit medical details\n"
-        "• *Cancel* to discard and return to menu"
+
+# ============================================================
+# SEND TEXT MESSAGE TO WHATSAPP
+# ============================================================
+
+def send_whatsapp_message(
+    recipient_phone: str,
+    message_text: str
+):
+
+    headers = {
+        "Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": recipient_phone,
+        "type": "text",
+        "text": {
+            "preview_url": False,
+            "body": message_text
+        }
+    }
+
+    try:
+
+        response = requests.post(
+            WHATSAPP_API_URL,
+            headers=headers,
+            json=payload,
+            timeout=20
+        )
+
+        print("WhatsApp API status:", response.status_code)
+        print("WhatsApp API response:", response.text)
+
+        return response.ok
+
+    except Exception as error:
+
+        print("WhatsApp API error:", error)
+
+        return None
+
+
+# ============================================================
+# PROCESS MESSAGE
+# ============================================================
+
+def process_message(
+    user_id: str,
+    text: str,
+    message_type: str
+):
+
+    user_id = user_id.strip()
+
+    text = text.strip()
+
+    message_type = message_type.lower().strip()
+
+    state = user_states.get(
+        user_id,
+        "menu"
     )
 
-# ========================================================
-# MAIN MESSAGE HANDLER
-# ========================================================
 
-def handle_message(user_id: str, text: str = "", message_type: str = "text") -> dict:
-    """
-    Handles incoming messages from WhatsApp users based on conversation state.
-    
-    Args:
-        user_id (str): Unique identifier for the user (e.g. phone number).
-        text (str): The text message sent by the user.
-        message_type (str): Type of message ('text', 'image', 'video', etc.).
-        
-    Returns:
-        dict: A dictionary containing the response payload, e.g. {"reply": ...}.
-    """
-    text = text.strip() if text else ""
-    state = user_states.get(user_id, "menu")
+    # ========================================================
+    # START / MENU
+    # ========================================================
 
-    # Global reset command
-    if text.lower() in ["menu", "restart", "start", "hi", "hello", "reset"] and state == "menu":
+    if text.lower() in [
+        "hi",
+        "hello",
+        "start",
+        "menu"
+    ]:
+
         user_states[user_id] = "menu"
-        return {"reply": main_menu()}
+
+        return {
+            "reply": main_menu()
+        }
+
 
     # ========================================================
-    # MAIN MENU STATE
+    # MAIN MENU
     # ========================================================
+
     if state == "menu":
-        if text in ["1", "register", "register dog", "new dog"]:
-            user_registration[user_id] = {}
-            user_states[user_id] = "registration_name"
+
+        # ----------------------------------------------------
+        # OPTION 1
+        # ----------------------------------------------------
+
+        if text == "1":
+
+            user_states[user_id] = "identification"
+
             return {
                 "reply": (
-                    "🐾 *New Dog Registration*\n\n"
-                    "Please enter the dog's name (or a description if unnamed):\n\n"
-                    "Example: Bruno"
+                    "🔎 *Identify an Unknown Dog*\n\n"
+                    "Please send the dog's nose photo "
+                    "or a 2-second nose video.\n\n"
+                    "📷 Make sure the nose is clearly visible."
                 )
             }
-        elif text in ["2", "update", "update dog", "update medical"]:
-            user_states[user_id] = "update_dog_id"
+
+
+        # ----------------------------------------------------
+        # OPTION 2
+        # ----------------------------------------------------
+
+        elif text == "2":
+
+            user_registration[user_id] = {
+                "name": None,
+                "area": None,
+                "medical_details": None
+            }
+
+            user_states[user_id] = "registration_nose"
+
             return {
                 "reply": (
-                    "🔍 *Update Dog Record*\n\n"
-                    "Please enter the Dog ID:\n\n"
+                    "📝 *Register a Known New Dog*\n\n"
+                    "Please send the dog's nose photo "
+                    "or a 2-second nose video."
+                )
+            }
+
+
+        # ----------------------------------------------------
+        # OPTION 3
+        # ----------------------------------------------------
+
+        elif text == "3":
+
+            user_states[user_id] = "update_dog_id"
+
+            return {
+                "reply": (
+                    "🔄 *Update Existing Dog Record*\n\n"
+                    "Please enter the Dog ID.\n\n"
                     "Example:\n"
                     "DOG-4F0FB602"
                 )
             }
-        elif text in ["3", "view", "list", "view dogs"]:
-            conn = get_connection()
-            cursor = conn.cursor()
-            cursor.execute("SELECT dog_id, name, area, medical_details FROM dogs ORDER BY created_at DESC LIMIT 10")
-            rows = cursor.fetchall()
-            conn.close()
 
-            if not rows:
-                return {
-                    "reply": "ℹ️ No dogs registered yet.\n\n" + main_menu()
-                }
 
-            listing = "📋 *Registered Dogs (Recent 10):*\n\n"
-            for row in rows:
-                listing += f"🆔 *{row[0]}* - {row[1]} (📍 {row[2]})\n  🏥 {row[3]}\n\n"
-
-            listing += main_menu()
-            return {"reply": listing}
         else:
+
             return {
                 "reply": (
-                    "❌ Invalid choice. Please select an option from the menu.\n\n"
+                    "❌ Invalid option.\n\n"
                     + main_menu()
                 )
             }
 
+
     # ========================================================
-    # REGISTRATION: NAME
+    # IDENTIFICATION
     # ========================================================
+
+    if state == "identification":
+
+        if message_type in [
+            "image",
+            "video"
+        ]:
+
+            user_states[user_id] = "menu"
+
+            return {
+                "reply": (
+                    "📷 Nose media received.\n\n"
+                    "🤖 AI nose-print recognition will be "
+                    "connected here.\n\n"
+                    "For now, this is the prototype placeholder.\n\n"
+                    + main_menu()
+                )
+            }
+
+        return {
+            "reply": (
+                "❌ Please send a nose photo "
+                "or a 2-second nose video."
+            )
+        }
+
+
+    # ========================================================
+    # REGISTRATION - NOSE
+    # ========================================================
+
+    if state == "registration_nose":
+
+        if message_type in [
+            "image",
+            "video"
+        ]:
+
+            user_states[user_id] = "registration_name"
+
+            return {
+                "reply": (
+                    "✅ Nose photo/video received.\n\n"
+                    "Now enter the dog's name.\n\n"
+                    "Example: Bruno"
+                )
+            }
+
+        return {
+            "reply": (
+                "❌ Please send a nose photo "
+                "or a 2-second nose video."
+            )
+        }
+
+
+    # ========================================================
+    # REGISTRATION - NAME
+    # ========================================================
+
     if state == "registration_name":
-        if message_type in ["image", "video"]:
-            return {"reply": "❌ Please enter the dog's name as text."}
 
-        if not text:
-            return {"reply": "❌ Name cannot be empty.\n\nPlease enter the dog's name."}
+        if message_type in [
+            "image",
+            "video"
+        ]:
 
-        if text.isdigit():
-            return {"reply": "❌ Please enter a valid name (not only numbers)."}
+            return {
+                "reply": (
+                    "❌ Please enter the dog's name as text.\n\n"
+                    "Example: Bruno"
+                )
+            }
 
-        user_registration[user_id] = {"name": text}
+        name = text
+
+        if not name:
+
+            return {
+                "reply": (
+                    "❌ Name cannot be empty.\n\n"
+                    "Please enter the dog's name."
+                )
+            }
+
+        if name.isdigit():
+
+            return {
+                "reply": (
+                    "❌ Please enter a valid dog name.\n\n"
+                    "Example: Bruno"
+                )
+            }
+
+        user_registration[user_id]["name"] = name
+
         user_states[user_id] = "registration_area"
 
         return {
             "reply": (
-                f"✅ Dog name set to *{text}*.\n\n"
-                "📍 Now, please enter the area/location where the dog is located:\n\n"
+                "✅ Name saved.\n\n"
+                "Now enter the dog's area/location.\n\n"
                 "Example: Mysore"
             )
         }
 
+
     # ========================================================
-    # REGISTRATION: AREA
+    # REGISTRATION - AREA
     # ========================================================
+
     if state == "registration_area":
-        if message_type in ["image", "video"]:
-            return {"reply": "❌ Please enter the area as text.\n\nExample: Mysore"}
 
-        if not text:
-            return {"reply": "❌ Area cannot be empty.\n\nPlease enter the area."}
+        if message_type in [
+            "image",
+            "video"
+        ]:
 
-        saved_name = user_registration.get(user_id, {}).get("name", "")
-        if text.lower() == saved_name.lower():
             return {
                 "reply": (
-                    "❌ Area cannot be the same as the dog's name.\n\n"
-                    "Please enter the actual area/location."
+                    "❌ Please enter the area/location as text.\n\n"
+                    "Example: Mysore"
                 )
             }
 
-        if text.isdigit():
-            return {"reply": "❌ Please enter a valid area/location."}
+        area = text
 
-        user_registration[user_id]["area"] = text
+        if not area:
+
+            return {
+                "reply": (
+                    "❌ Area cannot be empty.\n\n"
+                    "Please enter the dog's area/location."
+                )
+            }
+
+        saved_name = user_registration[user_id]["name"]
+
+        if area.lower() == saved_name.lower():
+
+            return {
+                "reply": (
+                    "❌ Area cannot be the same as "
+                    "the dog's name.\n\n"
+                    f"Dog name: {saved_name}\n\n"
+                    "Please enter the actual area/location.\n\n"
+                    "Example: Mysore"
+                )
+            }
+
+        if area.isdigit():
+
+            return {
+                "reply": (
+                    "❌ Please enter a valid area/location.\n\n"
+                    "Example: Mysore"
+                )
+            }
+
+        user_registration[user_id]["area"] = area
+
         user_states[user_id] = "registration_medical"
 
         return {
             "reply": (
-                f"✅ Area set to *{text}*.\n\n"
-                "🏥 Please enter medical details:\n\n"
+                "✅ Area saved.\n\n"
+                "Now enter medical details.\n\n"
                 "Example:\n"
                 "Vaccination: Yes\n"
                 "Sterilization: No"
             )
         }
 
+
     # ========================================================
-    # REGISTRATION: MEDICAL
+    # REGISTRATION - MEDICAL
     # ========================================================
+
     if state == "registration_medical":
-        if message_type in ["image", "video"]:
+
+        if message_type in [
+            "image",
+            "video"
+        ]:
+
             return {
                 "reply": (
-                    "❌ Please enter medical details as text.\n\n"
+                    "❌ Please enter the medical details as text.\n\n"
                     "Example:\n"
                     "Vaccination: Yes\n"
                     "Sterilization: No"
                 )
             }
 
-        if not text:
-            return {"reply": "❌ Medical details cannot be empty."}
+        medical_details = text
 
-        if not valid_medical_details(text):
+        if not medical_details:
+
             return {
                 "reply": (
-                    "❌ Please include vaccination or sterilization details.\n\n"
+                    "❌ Medical details cannot be empty.\n\n"
+                    "Please enter vaccination and "
+                    "sterilization details."
+                )
+            }
+
+        if not valid_medical_details(
+            medical_details
+        ):
+
+            return {
+                "reply": (
+                    "❌ Please provide medical details.\n\n"
                     "Example:\n"
                     "Vaccination: Yes\n"
                     "Sterilization: No"
                 )
             }
 
-        user_registration[user_id]["medical_details"] = text
+        user_registration[user_id][
+            "medical_details"
+        ] = medical_details
+
         user_states[user_id] = "registration_confirm"
 
-        return {"reply": confirmation_message(user_id)}
+        return {
+            "reply": confirmation_message(user_id)
+        }
+
 
     # ========================================================
-    # REGISTRATION: CONFIRMATION
+    # REGISTRATION - CONFIRMATION
     # ========================================================
+
     if state == "registration_confirm":
-        choice = text.lower()
-        if choice in ["1", "confirm", "yes", "save"]:
-            dog_data = user_registration.get(user_id, {})
-            dog_id = f"DOG-{uuid.uuid4().hex[:8].upper()}"
+
+        choice = text
+
+
+        # ----------------------------------------------------
+        # CONFIRM
+        # ----------------------------------------------------
+
+        if choice == "1":
+
+            data = user_registration[user_id]
+
+            dog_id = (
+                "DOG-"
+                + uuid.uuid4().hex[:8].upper()
+            )
 
             conn = get_connection()
             cursor = conn.cursor()
+
             cursor.execute("""
-                INSERT INTO dogs (dog_id, name, area, medical_details)
+                INSERT INTO dogs
+                (dog_id, name, area, medical_details)
                 VALUES (?, ?, ?, ?)
             """, (
                 dog_id,
-                dog_data.get("name", "Unknown"),
-                dog_data.get("area", "Unknown"),
-                dog_data.get("medical_details", "Unknown")
+                data["name"],
+                data["area"],
+                data["medical_details"]
             ))
+
             conn.commit()
             conn.close()
 
-            user_registration.pop(user_id, None)
+            qr_path = generate_qr(dog_id)
+
+            dog_name = data["name"]
+            dog_area = data["area"]
+
+            del user_registration[user_id]
+
             user_states[user_id] = "menu"
 
             return {
                 "reply": (
-                    "🎉 *Dog registered successfully!*\n\n"
-                    f"🆔 Dog ID: {dog_id}\n"
-                    f"🐶 Name: {dog_data.get('name')}\n"
-                    f"📍 Area: {dog_data.get('area')}\n"
-                    f"🏥 Medical: {dog_data.get('medical_details')}\n\n"
+                    "✅ *Dog registered successfully!*\n\n"
+                    f"🐶 Dog Name: {dog_name}\n"
+                    f"📍 Area: {dog_area}\n"
+                    f"🆔 Dog ID: {dog_id}\n\n"
+                    "📱 QR code has been generated.\n\n"
                     + main_menu()
-                )
+                ),
+                "dog_id": dog_id,
+                "qr_path": qr_path
             }
-        elif choice in ["2", "change name", "name"]:
-            user_states[user_id] = "registration_change_name"
-            return {"reply": "✏️ Please enter the new name for the dog:"}
-        elif choice in ["3", "change area", "area"]:
-            user_states[user_id] = "registration_change_area"
-            return {"reply": "✏️ Please enter the new area/location:"}
-        elif choice in ["4", "change medical", "medical"]:
-            user_states[user_id] = "registration_change_medical"
+
+
+        # ----------------------------------------------------
+        # CHANGE NAME
+        # ----------------------------------------------------
+
+        elif choice == "2":
+
+            user_states[user_id] = (
+                "registration_change_name"
+            )
+
             return {
                 "reply": (
-                    "✏️ Please enter the new medical details:\n\n"
+                    "✏️ *Change Name*\n\n"
+                    "Enter the new dog name.\n\n"
+                    "Example: Bruno"
+                )
+            }
+
+
+        # ----------------------------------------------------
+        # CHANGE AREA
+        # ----------------------------------------------------
+
+        elif choice == "3":
+
+            user_states[user_id] = (
+                "registration_change_area"
+            )
+
+            return {
+                "reply": (
+                    "✏️ *Change Area*\n\n"
+                    "Enter the new area/location.\n\n"
+                    "Example: Mysore"
+                )
+            }
+
+
+        # ----------------------------------------------------
+        # CHANGE MEDICAL
+        # ----------------------------------------------------
+
+        elif choice == "4":
+
+            user_states[user_id] = (
+                "registration_change_medical"
+            )
+
+            return {
+                "reply": (
+                    "✏️ *Change Medical Details*\n\n"
+                    "Enter the new medical details.\n\n"
                     "Example:\n"
                     "Vaccination: Yes\n"
                     "Sterilization: No"
                 )
             }
-        elif choice in ["cancel", "exit", "discard"]:
-            user_registration.pop(user_id, None)
-            user_states[user_id] = "menu"
-            return {
-                "reply": "❌ Registration cancelled.\n\n" + main_menu()
+
+
+        # ----------------------------------------------------
+        # START AGAIN
+        # ----------------------------------------------------
+
+        elif choice == "5":
+
+            user_registration[user_id] = {
+                "name": None,
+                "area": None,
+                "medical_details": None
             }
+
+            user_states[user_id] = "registration_nose"
+
+            return {
+                "reply": (
+                    "🔄 *Let's start again.*\n\n"
+                    "Please send the dog's nose photo "
+                    "or a 2-second nose video."
+                )
+            }
+
+
         else:
+
             return {
                 "reply": (
                     "❌ Invalid option.\n\n"
-                    + confirmation_message(user_id)
+                    "Please choose:\n\n"
+                    "1️⃣ Confirm & Register\n"
+                    "2️⃣ Change Name\n"
+                    "3️⃣ Change Area\n"
+                    "4️⃣ Change Medical Details\n"
+                    "5️⃣ Start Again"
                 )
             }
+
 
     # ========================================================
     # CHANGE NAME
     # ========================================================
+
     if state == "registration_change_name":
-        if message_type in ["image", "video"]:
-            return {"reply": "❌ Please enter the new name as text."}
 
-        if not text:
-            return {"reply": "❌ Name cannot be empty.\n\nPlease enter the name."}
+        if message_type in [
+            "image",
+            "video"
+        ]:
 
-        if text.isdigit():
-            return {"reply": "❌ Please enter a valid name."}
+            return {
+                "reply": (
+                    "❌ Please enter the new dog name as text.\n\n"
+                    "Example: Bruno"
+                )
+            }
 
-        if user_id not in user_registration:
-            user_registration[user_id] = {}
-        user_registration[user_id]["name"] = text
-        user_states[user_id] = "registration_confirm"
+        new_name = text
 
-        return {"reply": confirmation_message(user_id)}
+        if not new_name:
+
+            return {
+                "reply": (
+                    "❌ Name cannot be empty.\n\n"
+                    "Please enter the new dog name."
+                )
+            }
+
+        if new_name.isdigit():
+
+            return {
+                "reply": (
+                    "❌ Please enter a valid dog name."
+                )
+            }
+
+        user_registration[user_id][
+            "name"
+        ] = new_name
+
+        user_states[user_id] = (
+            "registration_confirm"
+        )
+
+        return {
+            "reply": confirmation_message(user_id)
+        }
+
 
     # ========================================================
     # CHANGE AREA
     # ========================================================
+
     if state == "registration_change_area":
 
-        if message_type in ["image", "video"]:
+        if message_type in [
+            "image",
+            "video"
+        ]:
+
             return {
                 "reply": (
                     "❌ Please enter the new area as text.\n\n"
@@ -385,6 +920,7 @@ def handle_message(user_id: str, text: str = "", message_type: str = "text") -> 
         new_area = text
 
         if not new_area:
+
             return {
                 "reply": (
                     "❌ Area cannot be empty.\n\n"
@@ -392,9 +928,10 @@ def handle_message(user_id: str, text: str = "", message_type: str = "text") -> 
                 )
             }
 
-        saved_name = user_registration.get(user_id, {}).get("name", "")
+        saved_name = user_registration[user_id]["name"]
 
         if new_area.lower() == saved_name.lower():
+
             return {
                 "reply": (
                     "❌ Area cannot be the same as "
@@ -404,28 +941,37 @@ def handle_message(user_id: str, text: str = "", message_type: str = "text") -> 
             }
 
         if new_area.isdigit():
+
             return {
                 "reply": (
                     "❌ Please enter a valid area/location."
                 )
             }
 
-        if user_id not in user_registration:
-            user_registration[user_id] = {}
-        user_registration[user_id]["area"] = new_area
+        user_registration[user_id][
+            "area"
+        ] = new_area
 
-        user_states[user_id] = "registration_confirm"
+        user_states[user_id] = (
+            "registration_confirm"
+        )
 
         return {
             "reply": confirmation_message(user_id)
         }
 
+
     # ========================================================
     # CHANGE MEDICAL DETAILS
     # ========================================================
+
     if state == "registration_change_medical":
 
-        if message_type in ["image", "video"]:
+        if message_type in [
+            "image",
+            "video"
+        ]:
+
             return {
                 "reply": (
                     "❌ Please enter medical details as text.\n\n"
@@ -438,13 +984,17 @@ def handle_message(user_id: str, text: str = "", message_type: str = "text") -> 
         new_medical = text
 
         if not new_medical:
+
             return {
                 "reply": (
                     "❌ Medical details cannot be empty."
                 )
             }
 
-        if not valid_medical_details(new_medical):
+        if not valid_medical_details(
+            new_medical
+        ):
+
             return {
                 "reply": (
                     "❌ Please include vaccination "
@@ -455,19 +1005,23 @@ def handle_message(user_id: str, text: str = "", message_type: str = "text") -> 
                 )
             }
 
-        if user_id not in user_registration:
-            user_registration[user_id] = {}
-        user_registration[user_id]["medical_details"] = new_medical
+        user_registration[user_id][
+            "medical_details"
+        ] = new_medical
 
-        user_states[user_id] = "registration_confirm"
+        user_states[user_id] = (
+            "registration_confirm"
+        )
 
         return {
             "reply": confirmation_message(user_id)
         }
 
+
     # ========================================================
     # UPDATE EXISTING DOG - DOG ID
     # ========================================================
+
     if state == "update_dog_id":
 
         dog_id = text.upper().strip()
@@ -486,6 +1040,7 @@ def handle_message(user_id: str, text: str = "", message_type: str = "text") -> 
         conn.close()
 
         if row is None:
+
             return {
                 "reply": (
                     "❌ Dog ID not found.\n\n"
@@ -511,12 +1066,18 @@ def handle_message(user_id: str, text: str = "", message_type: str = "text") -> 
             )
         }
 
+
     # ========================================================
-    # UPDATE EXISTING DOG - MEDICAL DETAILS
+    # UPDATE EXISTING DOG - MEDICAL
     # ========================================================
+
     if state == "update_medical":
 
-        if message_type in ["image", "video"]:
+        if message_type in [
+            "image",
+            "video"
+        ]:
+
             return {
                 "reply": (
                     "❌ Please enter medical details as text."
@@ -526,13 +1087,17 @@ def handle_message(user_id: str, text: str = "", message_type: str = "text") -> 
         medical_details = text
 
         if not medical_details:
+
             return {
                 "reply": (
                     "❌ Medical details cannot be empty."
                 )
             }
 
-        if not valid_medical_details(medical_details):
+        if not valid_medical_details(
+            medical_details
+        ):
+
             return {
                 "reply": (
                     "❌ Please include vaccination "
@@ -543,10 +1108,7 @@ def handle_message(user_id: str, text: str = "", message_type: str = "text") -> 
                 )
             }
 
-        dog_id = user_update_dogs.get(user_id)
-        if not dog_id:
-            user_states[user_id] = "menu"
-            return {"reply": "❌ Session expired. Please start again.\n\n" + main_menu()}
+        dog_id = user_update_dogs[user_id]
 
         conn = get_connection()
         cursor = conn.cursor()
@@ -563,7 +1125,7 @@ def handle_message(user_id: str, text: str = "", message_type: str = "text") -> 
         conn.commit()
         conn.close()
 
-        user_update_dogs.pop(user_id, None)
+        del user_update_dogs[user_id]
 
         user_states[user_id] = "menu"
 
@@ -576,9 +1138,11 @@ def handle_message(user_id: str, text: str = "", message_type: str = "text") -> 
             )
         }
 
+
     # ========================================================
     # FINAL FALLBACK
     # ========================================================
+
     user_states[user_id] = "menu"
 
     return {
@@ -589,14 +1153,202 @@ def handle_message(user_id: str, text: str = "", message_type: str = "text") -> 
         )
     }
 
-# ========================================================
-# FASTAPI WEBHOOK ENDPOINTS
-# ========================================================
 
-class MessagePayload(BaseModel):
-    user_id: str
-    text: str = ""
-    message_type: str = "text"
+# ============================================================
+# META WHATSAPP WEBHOOK
+# ============================================================
+
+@app.post("/webhook")
+async def whatsapp_webhook(request: Request):
+    print("POST /webhook received")
+    try:
+
+        payload = await request.json()
+
+        print("\n==============================")
+        print("META WEBHOOK RECEIVED")
+        print("==============================")
+        print(payload)
+
+
+        # ----------------------------------------------------
+        # CHECK BASIC PAYLOAD
+        # ----------------------------------------------------
+
+        if payload.get("object") != "whatsapp_business_account":
+
+            return {
+                "status": "ignored"
+            }
+
+
+        entries = payload.get("entry", [])
+
+        for entry in entries:
+
+            changes = entry.get("changes", [])
+
+            for change in changes:
+
+                value = change.get("value", {})
+
+                messages = value.get(
+                    "messages",
+                    []
+                )
+
+
+                # ------------------------------------------------
+                # IGNORE STATUS EVENTS
+                # ------------------------------------------------
+
+                if not messages:
+
+                    print(
+                        "No incoming message. "
+                        "Probably a status event."
+                    )
+
+                    continue
+
+
+                # ------------------------------------------------
+                # PROCESS EACH MESSAGE
+                # ------------------------------------------------
+
+                for incoming_message in messages:
+
+                    sender = incoming_message.get(
+                        "from"
+                    )
+
+                    message_type = incoming_message.get(
+                        "type",
+                        "text"
+                    )
+
+
+                    # --------------------------------------------
+                    # TEXT MESSAGE
+                    # --------------------------------------------
+
+                    if message_type == "text":
+
+                        text_body = (
+                            incoming_message
+                            .get("text", {})
+                            .get("body", "")
+                        )
+
+
+                    # --------------------------------------------
+                    # IMAGE MESSAGE
+                    # --------------------------------------------
+
+                    elif message_type == "image":
+
+                        text_body = ""
+
+                    # --------------------------------------------
+                    # VIDEO MESSAGE
+                    # --------------------------------------------
+
+                    elif message_type == "video":
+
+                        text_body = ""
+
+                    # --------------------------------------------
+                    # OTHER MESSAGE
+                    # --------------------------------------------
+
+                    else:
+
+                        text_body = ""
+
+
+                    print(
+                        "Sender:",
+                        sender
+                    )
+
+                    print(
+                        "Type:",
+                        message_type
+                    )
+
+                    print(
+                        "Text:",
+                        text_body
+                    )
+
+
+                    # --------------------------------------------
+                    # PROCESS USING EXISTING FLOW
+                    # --------------------------------------------
+
+                    result = process_message(
+                        user_id=sender,
+                        text=text_body,
+                        message_type=message_type
+                    )
+
+
+                    reply = result.get(
+                        "reply",
+                        ""
+                    )
+
+
+                    print(
+                        "Generated reply:",
+                        reply
+                    )
+
+
+                    # --------------------------------------------
+                    # SEND REPLY BACK TO WHATSAPP
+                    # --------------------------------------------
+
+                    if reply:
+
+                        send_whatsapp_message(
+                            recipient_phone=sender,
+                            message_text=reply
+                        )
+
+
+        return {
+            "status": "ok"
+        }
+
+
+    except Exception as error:
+
+        print(
+            "Webhook processing error:",
+            error
+        )
+
+        return {
+            "status": "error",
+            "message": str(error)
+        }
+
+
+# ============================================================
+# LOCAL TEST WEBHOOK
+# ============================================================
+
+@app.post("/test-message")
+def test_message(message: WhatsAppMessage):
+
+    result = process_message(
+        user_id=message.user_id,
+        text=message.message_text,
+        message_type=message.message_type
+    )
+
+    return result
 
 WHATSAPP_UI_HTML = """
 <!DOCTYPE html>
@@ -1097,168 +1849,3 @@ WHATSAPP_UI_HTML = """
 </body>
 </html>
 """
-
-@app.get("/", response_class=HTMLResponse)
-def root():
-    return HTMLResponse(content=WHATSAPP_UI_HTML)
-
-
-@app.post("/webhook")
-def webhook(payload: MessagePayload):
-    response = handle_message(
-        user_id=payload.user_id,
-        text=payload.text,
-        message_type=payload.message_type
-    )
-    return response
-
-# ========================================================
-# META WHATSAPP CLOUD API MESSAGING FUNCTIONS
-# ========================================================
-
-async def send_meta_whatsapp_message(to_number: str, message_text: str, phone_number_id: str = None) -> bool:
-    """
-    Sends a WhatsApp message using Meta Cloud Graph API.
-    """
-    config = get_meta_config()
-    phone_id = phone_number_id or config["phone_id"]
-    access_token = config["token"]
-    api_version = config["version"]
-
-    if not access_token or not phone_id:
-        print("⚠️ [Meta API] META_ACCESS_TOKEN or META_PHONE_NUMBER_ID is not configured. Reply not sent to WhatsApp.")
-        print(f"   (Message for {to_number}: {message_text[:60]}...)")
-        return False
-
-    url = f"https://graph.facebook.com/{api_version}/{phone_id}/messages"
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "messaging_product": "whatsapp",
-        "recipient_type": "individual",
-        "to": to_number,
-        "type": "text",
-        "text": {
-            "preview_url": False,
-            "body": message_text
-        }
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(url, json=payload, headers=headers)
-            if resp.status_code == 200:
-                print(f"✅ [Meta API] Message sent successfully to {to_number}")
-                return True
-            else:
-                print(f"❌ [Meta API] Error sending message ({resp.status_code}): {resp.text}")
-                return False
-    except Exception as e:
-        print(f"❌ [Meta API] Exception while sending message: {e}")
-        return False
-
-
-@app.get("/whatsapp")
-def meta_verify_webhook(request: Request):
-    """
-    Webhook verification endpoint for Meta WhatsApp Cloud API.
-    Meta sends a GET request with hub.mode, hub.verify_token, and hub.challenge.
-    """
-    config = get_meta_config()
-    params = request.query_params
-    mode = params.get("hub.mode")
-    token = params.get("hub.verify_token")
-    challenge = params.get("hub.challenge")
-    
-    expected_token = config["verify_token"]
-
-    if mode == "subscribe" and token == expected_token:
-        print("✅ [Meta API] Webhook verified successfully by Meta!")
-        return PlainTextResponse(content=challenge, status_code=200)
-    
-    print(f"❌ [Meta API] Webhook verification failed. Received token: {token}, Expected: {expected_token}")
-    return PlainTextResponse(content="Verification token mismatch", status_code=403)
-
-
-
-@app.post("/whatsapp")
-async def meta_whatsapp_webhook(request: Request):
-    """
-    Webhook receiver for incoming Meta WhatsApp Cloud API messages.
-    """
-    try:
-        data = await request.json()
-    except Exception:
-        return JSONResponse(content={"status": "invalid json"}, status_code=400)
-
-    entries = data.get("entry", [])
-    for entry in entries:
-        changes = entry.get("changes", [])
-        for change in changes:
-            value = change.get("value", {})
-            phone_number_id = value.get("metadata", {}).get("phone_number_id")
-
-            # Check if there are messages (ignore status updates like 'sent' or 'read')
-            if "messages" in value:
-                for message in value["messages"]:
-                    sender_id = message.get("from")  # User phone number (e.g. '919876543210')
-                    msg_type = message.get("type", "text")
-                    
-                    text_content = ""
-                    if msg_type == "text":
-                        text_content = message.get("text", {}).get("body", "")
-                    elif msg_type == "interactive":
-                        interactive = message.get("interactive", {})
-                        int_type = interactive.get("type")
-                        if int_type == "button_reply":
-                            text_content = interactive.get("button_reply", {}).get("title", "")
-                        elif int_type == "list_reply":
-                            text_content = interactive.get("list_reply", {}).get("title", "")
-                    elif msg_type in ["image", "document", "audio", "video"]:
-                        text_content = f"[{msg_type}]"
-                    
-                    if sender_id and text_content:
-                        print(f"📩 [Meta API] Received message from {sender_id}: {text_content}")
-                        bot_response = handle_message(
-                            user_id=sender_id,
-                            text=text_content,
-                            message_type=msg_type
-                        )
-                        
-                        reply_text = bot_response.get("reply", "")
-                        if reply_text:
-                            await send_meta_whatsapp_message(
-                                to_number=sender_id,
-                                message_text=reply_text,
-                                phone_number_id=phone_number_id
-                            )
-
-    return JSONResponse(content={"status": "ok"}, status_code=200)
-
-# ========================================================
-# CLI INTERACTIVE TEST RUNNER
-# ========================================================
-if __name__ == "__main__":
-    print("=" * 60)
-    print("🐾 Living Bridges WhatsApp Bot (Interactive Terminal Mode)")
-    print("Type your messages below. Type 'exit' to quit.")
-    print("=" * 60)
-    
-    test_user_id = "+1234567890"
-    init_res = handle_message(test_user_id, "hi")
-    print(f"\nBot:\n{init_res['reply']}\n")
-
-    while True:
-        try:
-            user_input = input("You: ")
-            if user_input.strip().lower() in ["exit", "quit"]:
-                print("Goodbye!")
-                break
-            
-            response = handle_message(test_user_id, user_input)
-            print(f"\nBot:\n{response['reply']}\n")
-        except (KeyboardInterrupt, EOFError):
-            print("\nSession ended.")
-            break
