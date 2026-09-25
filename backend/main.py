@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from backend.routes.health import router as health_router
 from backend.routes.identify import router as identify_router
+from backend.routes.privacy import router as privacy_router
 
 app = FastAPI(
     title="Canine Nose-Print Recognition API",
@@ -10,3 +11,4 @@ app = FastAPI(
 
 app.include_router(health_router)
 app.include_router(identify_router)
+app.include_router(privacy_router)

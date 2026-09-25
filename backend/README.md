@@ -41,7 +41,9 @@ canine-nose-print-recognition/
 |--------|----------|---------|
 | GET | `/health` | Checks whether the backend is running |
 | POST | `/identify` | Handles nose-print identification requests |
-| POST | `/register` | Handles new dog registration |
+| POST | `/dogs/register` | Handles new dog registration with caregiver privacy protection |
+| POST | `/privacy/register-caregiver` | Generates a caregiver token and stores the encrypted phone number |
+| GET | `/privacy/caregiver/{caregiver_token}` | Checks privacy-protected caregiver information |
 | GET | `/dog/{dog_id}` | Retrieves dog information |
 | GET | `/qr/generate` | Handles QR generation |
 | GET | `/webhook` | WhatsApp webhook verification |
@@ -59,6 +61,53 @@ Example response:
 
 ## Nose-Print Identification
 The `/identify` endpoint is connected to the nose-print processing service. Currently, the service contains placeholder functionality and returns a response confirming that the nose-print processing service is ready. The actual AI processing pipeline will be connected during the integration stage.
+
+## Caretaker Privacy Protection
+We implemented the first version of the caretaker privacy layer for the backend.
+
+### What was implemented
+- Caretaker phone numbers are treated as sensitive data.
+- A random caregiver token such as `CARE_8f31a92c...` is generated for each caregiver.
+- The original phone number is normalized and encrypted before storage.
+- The application uses the caregiver token instead of the raw phone number in normal responses.
+- Dog operational data such as location remains available as normal profile information.
+
+### Files added
+- `backend/services/privacy_service.py`
+- `backend/models/privacy.py`
+- `backend/routes/privacy.py`
+
+### Privacy logic
+The `PrivacyService` handles:
+- token generation
+- phone normalization
+- phone encryption using Fernet
+- phone decryption
+- phone lookup hash creation
+
+### Privacy flow
+1. User provides caretaker phone number.
+2. The backend generates a random token.
+3. The phone number is encrypted and stored securely.
+4. The dog profile stores the caregiver token instead of the actual phone number.
+5. Normal API responses never expose the phone number.
+
+### Example response
+```json
+{
+  "status": "success",
+  "dog": {
+    "dog_id": "BLR-6001",
+    "name": "Bruno",
+    "location": "Indiranagar",
+    "vaccination_status": "Verified",
+    "sterilization_status": "Completed",
+    "caregiver_token": "CARE_8f31a92c..."
+  }
+}
+```
+
+This ensures the dog profile remains usable while the caretaker's personal contact details remain protected.
 
 ## Nose-Print Processing Service
 The nose-print processing service is located at:
@@ -137,12 +186,14 @@ __pycache__/
 *.pyc
 
 ## Current Progress
-The FastAPI backend environment has been set up successfully. The modular backend structure has been created, including the main application, route files, service layer, environment configuration, and utility/model folders. The `/health` and `/identify` endpoints have been tested successfully using Swagger UI, and the remaining core endpoints have been created as the initial API structure.
+The FastAPI backend environment has been set up successfully. The modular backend structure has been created, including the main application, route files, service layer, environment configuration, and utility/model folders. The `/health` and `/identify` endpoints were tested successfully through the backend structure, and the privacy layer has now been added to protect caretaker data.
+
+We also implemented the initial caretaker privacy flow: token generation, phone encryption, and secure caregiver reference handling. The dog registration endpoint has been updated to keep the dog location visible while returning only a caregiver token instead of the raw phone number.
 
 The local Uvicorn server is running successfully, Swagger documentation is available, and the project is connected to GitHub for version control and collaboration.
 
 ## Current Status
-The basic backend architecture and API structure are ready and tested locally. The current endpoints provide the foundation for integrating the remaining project modules. The actual AI pipeline, database connection, WhatsApp credentials, and complete end-to-end processing are not yet connected.
+The basic backend architecture and API structure are ready and tested locally. The current endpoints provide the foundation for integrating the remaining project modules. The privacy layer for caretaker information has been implemented as an initial version and is ready for further integration with the database and WhatsApp flow. The actual AI pipeline, full database persistence, WhatsApp credentials, and complete end-to-end processing are not yet connected.
 
 ## Next Steps
 - Connect the video processing pipeline
