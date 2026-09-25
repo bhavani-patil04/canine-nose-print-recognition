@@ -1,24 +1,26 @@
-# Byte-compiled / optimized / DLL files
+# Environment variables
+.env
+
+# Python
 __pycache__/
 *.py[cod]
-*$py.class
+*.pyo
 
-# Environment Variables & Secrets
-.env
-.env.local
-.env.*.local
+# Virtual environment
+.venv/
+venv/
+env/
 
-# Databases & local state
-*.db
-*.sqlite
-*.sqlite3
+# Database
+dogs.db
 
-# Operating System Files
+# Generated QR codes
+qr_codes/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
 .DS_Store
 Thumbs.db
-
-# Virtual Environments
-venv/
-.venv/
-env/
-ENV/
