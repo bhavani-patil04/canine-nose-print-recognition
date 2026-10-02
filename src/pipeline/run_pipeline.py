@@ -3,6 +3,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+
 from ultralytics import YOLO
 
 from basicsr.archs.rrdbnet_arch import RRDBNet
@@ -10,6 +11,7 @@ from realesrgan import RealESRGANer
 
 from tensorflow.keras.applications import ResNet50
 from tensorflow.keras.applications.resnet50 import preprocess_input
+from tensorflow.keras.models import load_model
 
 
 # ============================================================
@@ -22,7 +24,7 @@ BASE_DIR = Path(
 
 
 # ============================================================
-# MODELS
+# MODEL PATHS
 # ============================================================
 
 FACE_MODEL_PATH = (
@@ -52,6 +54,12 @@ LAST_NOSE_MODEL_PATH = (
     / "last.pt"
 )
 
+NOSE_VALIDATOR_PATH = (
+    BASE_DIR
+    / "models"
+    / "dog_nose_validator.keras"
+)
+
 REALESRGAN_MODEL_PATH = (
     BASE_DIR
     / "models"
@@ -63,7 +71,10 @@ REALESRGAN_MODEL_PATH = (
 # OUTPUT
 # ============================================================
 
-OUTPUT_ROOT = BASE_DIR / "pipeline_results"
+OUTPUT_ROOT = (
+    BASE_DIR
+    / "pipeline_results"
+)
 
 
 # ============================================================
@@ -92,28 +103,68 @@ MAX_CENTER_SHIFT = 0.35
 
 
 # ============================================================
+# IMAGE QUALITY
+# ============================================================
+
+QUALITY_MIN_WIDTH = 224
+QUALITY_MIN_HEIGHT = 224
+
+# Prototype threshold.
+# This can be calibrated later using an evaluation dataset.
+QUALITY_MIN_LAPLACIAN = 50.0
+
+
+# ============================================================
+# DOG NOSE VALIDATOR
+# ============================================================
+
+# The validator was trained with:
+#
+# 0 = dog_nose_present
+# 1 = not_dog_nose
+#
+# Therefore:
+#
+# prediction < 0.50 -> DOG_NOSE_PRESENT
+# prediction >= 0.50 -> NOT_DOG_NOSE
+
+NOSE_VALIDATOR_THRESHOLD = 0.50
+
+
+# ============================================================
 # LOAD MODELS
 # ============================================================
 
 print()
 print("=" * 70)
-print("             CANINE NOSE PRINT AI PIPELINE")
+print("              CANINE NOSE PRINT AI PIPELINE")
 print("=" * 70)
 
 print()
 print("Loading face detector...")
-face_model = YOLO(str(FACE_MODEL_PATH))
+face_model = YOLO(
+    str(FACE_MODEL_PATH)
+)
 
 print("Loading best nose detector...")
-best_nose_model = YOLO(str(BEST_NOSE_MODEL_PATH))
+best_nose_model = YOLO(
+    str(BEST_NOSE_MODEL_PATH)
+)
 
 print("Loading last nose detector...")
-last_nose_model = YOLO(str(LAST_NOSE_MODEL_PATH))
+last_nose_model = YOLO(
+    str(LAST_NOSE_MODEL_PATH)
+)
 
+print("Loading dog-nose validator...")
 
-# ============================================================
-# LOAD REAL-ESRGAN
-# ============================================================
+nose_validator = load_model(
+    str(NOSE_VALIDATOR_PATH),
+    custom_objects={
+        "preprocess_input": preprocess_input
+    },
+    compile=False
+)
 
 print("Loading Real-ESRGAN...")
 
@@ -131,20 +182,14 @@ upsampler = RealESRGANer(
     model_path=str(REALESRGAN_MODEL_PATH),
     model=rrdb_model,
 
-    # IMPORTANT:
-    # tile=128 was the stable setting
-    # that completed all 19 runtime images.
+    # Stable setting used successfully
+    # on all 19 runtime images.
     tile=128,
 
     tile_pad=10,
     pre_pad=0,
     half=False
 )
-
-
-# ============================================================
-# LOAD RESNET50
-# ============================================================
 
 print("Loading ResNet50...")
 
@@ -158,10 +203,71 @@ print("All models loaded.")
 
 
 # ============================================================
-# FACE DETECTION
+# STEP 1
+# IMAGE QUALITY CHECK
 # ============================================================
 
-def detect_and_crop_face(image):
+def check_image_quality(image):
+
+    if image is None or image.size == 0:
+        return (
+            False,
+            "IMAGE_NOT_READABLE",
+            0.0
+        )
+
+    height, width = image.shape[:2]
+
+    if (
+        width < QUALITY_MIN_WIDTH
+        or height < QUALITY_MIN_HEIGHT
+    ):
+        return (
+            False,
+            f"IMAGE_TOO_SMALL ({width}x{height})",
+            0.0
+        )
+
+    gray = cv2.cvtColor(
+        image,
+        cv2.COLOR_BGR2GRAY
+    )
+
+    laplacian_variance = float(
+        cv2.Laplacian(
+            gray,
+            cv2.CV_64F
+        ).var()
+    )
+
+    if laplacian_variance < QUALITY_MIN_LAPLACIAN:
+        return (
+            False,
+            "LOW_IMAGE_QUALITY / TOO_BLURRY",
+            laplacian_variance
+        )
+
+    return (
+        True,
+        "QUALITY_PASS",
+        laplacian_variance
+    )
+
+
+# ============================================================
+# STEP 2A
+# DOG FACE DETECTION
+#
+# Used only as part of Step 2 validation/routing.
+#
+# If a dog face is found:
+#     classify input as FULL_DOG
+#
+# If no dog face is found:
+#     test the image with the trained dog-nose validator.
+# ============================================================
+
+def detect_dog_face(image):
 
     height, width = image.shape[:2]
 
@@ -202,10 +308,6 @@ def detect_and_crop_face(image):
         for v in xyxy
     ]
 
-    # --------------------------------------------------------
-    # Clamp face box
-    # --------------------------------------------------------
-
     x1 = max(
         0,
         min(x1, width - 1)
@@ -226,15 +328,159 @@ def detect_and_crop_face(image):
         min(y2, height)
     )
 
+    if x2 <= x1 or y2 <= y1:
+        return None, None
+
+    return (
+        np.array(
+            [x1, y1, x2, y2],
+            dtype=np.int32
+        ),
+        confidence
+    )
+
+
+# ============================================================
+# STEP 2B
+# DOG-NOSE VALIDATION
+#
+# IMPORTANT:
+# This model was trained on nose images.
+#
+# It is used ONLY when the face detector does not find
+# a full dog face.
+#
+# It determines whether the uploaded image itself
+# is a dog-nose image.
+# ============================================================
+
+def validate_uploaded_nose(image):
+
+    image_224 = cv2.resize(
+        image,
+        (224, 224),
+        interpolation=cv2.INTER_LANCZOS4
+    )
+
+    image_224 = cv2.cvtColor(
+        image_224,
+        cv2.COLOR_BGR2RGB
+    )
+
+    image_224 = image_224.astype(
+        np.float32
+    )
+
+    # EXACT preprocessing used during validator training.
+    image_224 = preprocess_input(
+        image_224
+    )
+
+    image_224 = np.expand_dims(
+        image_224,
+        axis=0
+    )
+
+    prediction = float(
+        nose_validator.predict(
+            image_224,
+            verbose=0
+        )[0][0]
+    )
+
+    if prediction >= NOSE_VALIDATOR_THRESHOLD:
+
+        return (
+            False,
+            "NOT_DOG_NOSE",
+            prediction
+        )
+
+    confidence = 1.0 - prediction
+
+    return (
+        True,
+        "DOG_NOSE_PRESENT",
+        confidence
+    )
+
+
+# ============================================================
+# STEP 2
+# DOG VALIDATION / INPUT ROUTING
+# ============================================================
+
+def validate_and_route_input(image):
+
+    # --------------------------------------------------------
+    # First check whether this is a full dog image.
+    # --------------------------------------------------------
+
+    face_box, face_confidence = (
+        detect_dog_face(image)
+    )
+
+    if face_box is not None:
+
+        return {
+            "input_type": "FULL_DOG",
+            "face_box": face_box,
+            "face_confidence": face_confidence,
+            "nose_validation": None,
+            "nose_validation_confidence": None
+        }
+
+    # --------------------------------------------------------
+    # No dog face found.
+    #
+    # Now determine whether the uploaded image itself
+    # is a dog nose.
+    # --------------------------------------------------------
+
+    (
+        is_dog_nose,
+        validation_result,
+        validation_confidence
+    ) = validate_uploaded_nose(image)
+
+    if is_dog_nose:
+
+        return {
+            "input_type": "DOG_NOSE",
+            "face_box": None,
+            "face_confidence": None,
+            "nose_validation": validation_result,
+            "nose_validation_confidence": validation_confidence
+        }
+
+    return {
+        "input_type": "INVALID",
+        "face_box": None,
+        "face_confidence": None,
+        "nose_validation": validation_result,
+        "nose_validation_confidence": validation_confidence
+    }
+
+
+# ============================================================
+# STEP 3
+# CROP DOG FACE
+# ============================================================
+
+def crop_face(image, face_box):
+
+    height, width = image.shape[:2]
+
+    x1, y1, x2, y2 = [
+        int(v)
+        for v in face_box
+    ]
+
     face_width = x2 - x1
     face_height = y2 - y1
 
     if face_width <= 0 or face_height <= 0:
-        return None, None
-
-    # --------------------------------------------------------
-    # 15% padding used in our tested face cropper
-    # --------------------------------------------------------
+        return None
 
     pad_x = int(
         face_width * FACE_PADDING
@@ -261,19 +507,23 @@ def detect_and_crop_face(image):
     ]
 
     if face_crop.size == 0:
-        return None, None
+        return None
 
-    return face_crop, confidence
+    return face_crop
 
 
 # ============================================================
+# STEP 4
 # NOSE DETECTION
+#
+# best.pt first
+# last.pt only if best.pt detects nothing
 # ============================================================
 
 def detect_nose(face_image):
 
     # --------------------------------------------------------
-    # STEP 1: best.pt
+    # FIRST: best.pt
     # --------------------------------------------------------
 
     results = best_nose_model.predict(
@@ -285,7 +535,10 @@ def detect_nose(face_image):
 
     boxes = results[0].boxes
 
-    if boxes is not None and len(boxes) > 0:
+    if (
+        boxes is not None
+        and len(boxes) > 0
+    ):
 
         confidences = (
             boxes.conf
@@ -314,7 +567,7 @@ def detect_nose(face_image):
         )
 
     # --------------------------------------------------------
-    # STEP 2: last.pt fallback
+    # SECOND: last.pt FALLBACK
     # --------------------------------------------------------
 
     results = last_nose_model.predict(
@@ -326,8 +579,15 @@ def detect_nose(face_image):
 
     boxes = results[0].boxes
 
-    if boxes is None or len(boxes) == 0:
-        return None, None, None
+    if (
+        boxes is None
+        or len(boxes) == 0
+    ):
+        return (
+            None,
+            None,
+            None
+        )
 
     confidences = (
         boxes.conf
@@ -357,8 +617,8 @@ def detect_nose(face_image):
 
 
 # ============================================================
+# STEP 5
 # NOSE CROPPER V3
-# YOLO-GUIDED VERSION
 # ============================================================
 
 def crop_nose_v3(
@@ -372,10 +632,6 @@ def crop_nose_v3(
         int(v)
         for v in nose_box
     ]
-
-    # --------------------------------------------------------
-    # Clamp YOLO box
-    # --------------------------------------------------------
 
     x1 = max(
         0,
@@ -400,12 +656,11 @@ def crop_nose_v3(
     nose_width = x2 - x1
     nose_height = y2 - y1
 
-    if nose_width <= 0 or nose_height <= 0:
+    if (
+        nose_width <= 0
+        or nose_height <= 0
+    ):
         return None
-
-    # --------------------------------------------------------
-    # YOLO BOX CENTER
-    # --------------------------------------------------------
 
     center_x = (
         x1 + x2
@@ -415,36 +670,34 @@ def crop_nose_v3(
         y1 + y2
     ) / 2.0
 
-    # --------------------------------------------------------
-    # CENTRAL 70% REFINEMENT REGION
-    # --------------------------------------------------------
-
     refine_width = (
-        nose_width * REFINE_RATIO
+        nose_width
+        * REFINE_RATIO
     )
 
     refine_height = (
-        nose_height * REFINE_RATIO
+        nose_height
+        * REFINE_RATIO
     )
 
     refine_x1 = int(
-        center_x -
-        refine_width / 2
+        center_x
+        - refine_width / 2
     )
 
     refine_y1 = int(
-        center_y -
-        refine_height / 2
+        center_y
+        - refine_height / 2
     )
 
     refine_x2 = int(
-        center_x +
-        refine_width / 2
+        center_x
+        + refine_width / 2
     )
 
     refine_y2 = int(
-        center_y +
-        refine_height / 2
+        center_y
+        + refine_height / 2
     )
 
     refine_x1 = max(
@@ -475,10 +728,6 @@ def crop_nose_v3(
     if refine.size == 0:
         return None
 
-    # --------------------------------------------------------
-    # DARK NOSE MASK
-    # --------------------------------------------------------
-
     gray = cv2.cvtColor(
         refine,
         cv2.COLOR_BGR2GRAY
@@ -489,10 +738,6 @@ def crop_nose_v3(
         0,
         DARK_THRESHOLD
     )
-
-    # --------------------------------------------------------
-    # MORPHOLOGY
-    # --------------------------------------------------------
 
     small_kernel = cv2.getStructuringElement(
         cv2.MORPH_ELLIPSE,
@@ -518,10 +763,6 @@ def crop_nose_v3(
         iterations=1
     )
 
-    # --------------------------------------------------------
-    # CONTOURS
-    # --------------------------------------------------------
-
     contours, _ = cv2.findContours(
         dark_mask,
         cv2.RETR_EXTERNAL,
@@ -532,8 +773,8 @@ def crop_nose_v3(
     best_score = -1
 
     yolo_area = (
-        nose_width *
-        nose_height
+        nose_width
+        * nose_height
     )
 
     for contour in contours:
@@ -546,8 +787,8 @@ def crop_nose_v3(
             continue
 
         contour_ratio = (
-            area /
-            float(yolo_area)
+            area
+            / float(yolo_area)
         )
 
         if contour_ratio < MIN_CONTOUR_RATIO:
@@ -564,32 +805,32 @@ def crop_nose_v3(
             continue
 
         contour_cx = (
-            moments["m10"] /
-            moments["m00"]
+            moments["m10"]
+            / moments["m00"]
         )
 
         contour_cy = (
-            moments["m01"] /
-            moments["m00"]
+            moments["m01"]
+            / moments["m00"]
         )
-
-        # Convert to original image coordinates
 
         contour_cx += refine_x1
         contour_cy += refine_y1
 
-        dx = abs(
-            contour_cx - center_x
-        ) / max(
-            nose_width,
-            1
+        dx = (
+            abs(
+                contour_cx
+                - center_x
+            )
+            / max(nose_width, 1)
         )
 
-        dy = abs(
-            contour_cy - center_y
-        ) / max(
-            nose_height,
-            1
+        dy = (
+            abs(
+                contour_cy
+                - center_y
+            )
+            / max(nose_height, 1)
         )
 
         if dx > MAX_CENTER_SHIFT:
@@ -598,9 +839,10 @@ def crop_nose_v3(
         if dy > MAX_CENTER_SHIFT:
             continue
 
-        center_score = 1.0 - (
-            dx + dy
-        ) / 2.0
+        center_score = (
+            1.0
+            - (dx + dy) / 2.0
+        )
 
         size_score = min(
             contour_ratio,
@@ -609,31 +851,26 @@ def crop_nose_v3(
 
         score = (
             center_score * 0.7
-            +
-            size_score * 0.3
+            + size_score * 0.3
         )
 
         if score > best_score:
-
             best_score = score
             best_contour = contour
 
-    # --------------------------------------------------------
-    # FINAL CROP BOX
-    # --------------------------------------------------------
-
     if best_contour is not None:
 
-        contour_x, contour_y, contour_w, contour_h = (
-            cv2.boundingRect(
-                best_contour
-            )
+        (
+            contour_x,
+            contour_y,
+            contour_w,
+            contour_h
+        ) = cv2.boundingRect(
+            best_contour
         )
 
         contour_x += refine_x1
         contour_y += refine_y1
-
-        # Never allow contour outside YOLO box
 
         final_x1 = max(
             x1,
@@ -656,19 +893,19 @@ def crop_nose_v3(
         )
 
         final_w = (
-            final_x2 - final_x1
+            final_x2
+            - final_x1
         )
 
         final_h = (
-            final_y2 - final_y1
+            final_y2
+            - final_y1
         )
 
         if (
             final_w <= 0
-            or
-            final_h <= 0
+            or final_h <= 0
         ):
-
             final_x1 = x1
             final_y1 = y1
             final_x2 = x2
@@ -681,26 +918,24 @@ def crop_nose_v3(
         final_x2 = x2
         final_y2 = y2
 
-    # --------------------------------------------------------
-    # SMALL PADDING
-    # --------------------------------------------------------
-
     crop_width = (
-        final_x2 - final_x1
+        final_x2
+        - final_x1
     )
 
     crop_height = (
-        final_y2 - final_y1
+        final_y2
+        - final_y1
     )
 
     pad_x = int(
-        crop_width *
-        CROP_PADDING
+        crop_width
+        * CROP_PADDING
     )
 
     pad_y = int(
-        crop_height *
-        CROP_PADDING
+        crop_height
+        * CROP_PADDING
     )
 
     final_x1 -= pad_x
@@ -708,16 +943,14 @@ def crop_nose_v3(
     final_x2 += pad_x
     final_y2 += pad_y
 
-    # --------------------------------------------------------
-    # CONTROLLED SQUARE CROP
-    # --------------------------------------------------------
-
     crop_width = (
-        final_x2 - final_x1
+        final_x2
+        - final_x1
     )
 
     crop_height = (
-        final_y2 - final_y1
+        final_y2
+        - final_y1
     )
 
     side = int(
@@ -728,61 +961,53 @@ def crop_nose_v3(
     )
 
     crop_center_x = (
-        final_x1 + final_x2
+        final_x1
+        + final_x2
     ) / 2.0
 
     crop_center_y = (
-        final_y1 + final_y2
+        final_y1
+        + final_y2
     ) / 2.0
 
     final_x1 = int(
-        crop_center_x -
-        side / 2
+        crop_center_x
+        - side / 2
     )
 
     final_y1 = int(
-        crop_center_y -
-        side / 2
+        crop_center_y
+        - side / 2
     )
 
     final_x2 = int(
-        crop_center_x +
-        side / 2
+        crop_center_x
+        + side / 2
     )
 
     final_y2 = int(
-        crop_center_y +
-        side / 2
+        crop_center_y
+        + side / 2
     )
 
-    # --------------------------------------------------------
-    # IMAGE BOUNDARY
-    # --------------------------------------------------------
-
     if final_x1 < 0:
-
         final_x2 += -final_x1
         final_x1 = 0
 
     if final_y1 < 0:
-
         final_y2 += -final_y1
         final_y1 = 0
 
     if final_x2 > width:
-
         final_x1 -= (
             final_x2 - width
         )
-
         final_x2 = width
 
     if final_y2 > height:
-
         final_y1 -= (
             final_y2 - height
         )
-
         final_y2 = height
 
     final_x1 = max(
@@ -817,6 +1042,7 @@ def crop_nose_v3(
 
 
 # ============================================================
+# STEP 6
 # NOSE ENHANCEMENT
 # ============================================================
 
@@ -845,8 +1071,8 @@ def deblur_image(
     )
 
     kernel = np.exp(
-        -(xx**2 + yy**2) /
-        (2 * sigma**2)
+        -(xx ** 2 + yy ** 2)
+        / (2 * sigma ** 2)
     )
 
     kernel /= kernel.sum()
@@ -876,8 +1102,8 @@ def deblur_image(
         )
 
         relative = (
-            image_float /
-            estimated
+            image_float
+            / estimated
         )
 
         correction = cv2.filter2D(
@@ -901,22 +1127,14 @@ def deblur_image(
     )
 
 
-def enhance_nose(
-    image
-):
+def enhance_nose(image):
 
-    # --------------------------------------------------------
-    # Real-ESRGAN
-    # --------------------------------------------------------
-
-    enhanced, _ = upsampler.enhance(
-        image,
-        outscale=4
+    enhanced, _ = (
+        upsampler.enhance(
+            image,
+            outscale=4
+        )
     )
-
-    # --------------------------------------------------------
-    # Brightness correction
-    # --------------------------------------------------------
 
     gray = cv2.cvtColor(
         enhanced,
@@ -930,7 +1148,9 @@ def enhance_nose(
         gamma = 0.75
 
         table = np.array([
-            ((i / 255.0) ** gamma) * 255
+            (
+                (i / 255.0) ** gamma
+            ) * 255
             for i in range(256)
         ]).astype(
             np.uint8
@@ -946,7 +1166,9 @@ def enhance_nose(
         gamma = 1.20
 
         table = np.array([
-            ((i / 255.0) ** gamma) * 255
+            (
+                (i / 255.0) ** gamma
+            ) * 255
             for i in range(256)
         ]).astype(
             np.uint8
@@ -957,28 +1179,16 @@ def enhance_nose(
             table
         )
 
-    # --------------------------------------------------------
-    # Resize
-    # --------------------------------------------------------
-
     enhanced = cv2.resize(
         enhanced,
         (224, 224),
         interpolation=cv2.INTER_LANCZOS4
     )
 
-    # --------------------------------------------------------
-    # Richardson-Lucy deblur
-    # --------------------------------------------------------
-
     enhanced = deblur_image(
         enhanced,
         iterations=10
     )
-
-    # --------------------------------------------------------
-    # Controlled sharpening
-    # --------------------------------------------------------
 
     blurred = cv2.GaussianBlur(
         enhanced,
@@ -1006,12 +1216,11 @@ def enhance_nose(
 
 
 # ============================================================
-# RESNET50 PREPROCESSING
+# STEP 7
+# RESNET50 FEATURE EXTRACTION
 # ============================================================
 
-def prepare_for_resnet(
-    image
-):
+def extract_features(image):
 
     image = cv2.cvtColor(
         image,
@@ -1027,6 +1236,7 @@ def prepare_for_resnet(
         np.float32
     )
 
+    # EXACT ImageNet ResNet50 preprocessing.
     image = preprocess_input(
         image
     )
@@ -1036,29 +1246,19 @@ def prepare_for_resnet(
         axis=0
     )
 
-    return image
-
-
-# ============================================================
-# FEATURE EXTRACTION
-# ============================================================
-
-def extract_features(
-    image
-):
-
-    preprocessed = prepare_for_resnet(
-        image
+    features = (
+        resnet_model.predict(
+            image,
+            verbose=0
+        )
     )
 
-    features = resnet_model.predict(
-        preprocessed,
-        verbose=0
-    )
-
-    if features.shape != (1, 2048):
+    if features.shape != (
+        1,
+        2048
+    ):
         raise ValueError(
-            f"Unexpected feature shape: "
+            "Unexpected feature shape: "
             f"{features.shape}"
         )
 
@@ -1069,30 +1269,23 @@ def extract_features(
 # MAIN PIPELINE
 # ============================================================
 
-def run_pipeline(
-    input_path
-):
+def run_pipeline(input_path):
 
     input_path = Path(
         input_path
     )
 
     if not input_path.exists():
-
         raise FileNotFoundError(
             f"Input image not found: "
             f"{input_path}"
         )
 
-    # --------------------------------------------------------
-    # Create output directory
-    # --------------------------------------------------------
-
     image_name = input_path.stem
 
     output_dir = (
-        OUTPUT_ROOT /
-        image_name
+        OUTPUT_ROOT
+        / image_name
     )
 
     output_dir.mkdir(
@@ -1100,16 +1293,11 @@ def run_pipeline(
         exist_ok=True
     )
 
-    # --------------------------------------------------------
-    # LOAD ORIGINAL IMAGE
-    # --------------------------------------------------------
-
     image = cv2.imread(
         str(input_path)
     )
 
     if image is None:
-
         raise ValueError(
             f"Could not read image: "
             f"{input_path}"
@@ -1122,112 +1310,250 @@ def run_pipeline(
     )
     print("=" * 70)
 
-    # --------------------------------------------------------
-    # STEP 1: FACE DETECTION
-    # --------------------------------------------------------
-
-    print()
-    print("[1/6] Detecting dog face...")
-
-    face_crop, face_confidence = (
-        detect_and_crop_face(image)
-    )
-
-    if face_crop is None:
-
-        print(
-            "RESULT: NO DOG FACE DETECTED"
-        )
-
-        return False
-
-    face_path = (
-        output_dir /
-        "face_crop.jpg"
-    )
-
-    cv2.imwrite(
-        str(face_path),
-        face_crop
-    )
-
-    print(
-        f"Face detected "
-        f"(confidence={face_confidence:.2f})"
-    )
-
-    # --------------------------------------------------------
-    # STEP 2: NOSE DETECTION
-    # --------------------------------------------------------
+    # ========================================================
+    # STEP 1
+    # IMAGE QUALITY
+    # ========================================================
 
     print()
     print(
-        "[2/6] Detecting nose..."
+        "[1/6] Checking image quality..."
     )
 
-    nose_box, nose_confidence, nose_model = (
-        detect_nose(face_crop)
+    (
+        quality_ok,
+        quality_status,
+        quality_score
+    ) = check_image_quality(
+        image
     )
 
-    if nose_box is None:
+    print(
+        f"Laplacian variance: "
+        f"{quality_score:.2f}"
+    )
+
+    if not quality_ok:
 
         print(
-            "RESULT: NO NOSE DETECTED"
+            f"RESULT: {quality_status}"
         )
 
         return False
 
     print(
-        f"Nose detected using "
-        f"{nose_model} "
-        f"(confidence={nose_confidence:.2f})"
+        "Image quality: PASS"
     )
 
-    # --------------------------------------------------------
-    # STEP 3: NOSE CROPPING
-    # --------------------------------------------------------
+    # ========================================================
+    # STEP 2
+    # DOG VALIDATION + INPUT ROUTING
+    # ========================================================
 
     print()
     print(
-        "[3/6] Cropping nose..."
+        "[2/6] Validating input..."
     )
 
-    nose_crop = crop_nose_v3(
-        face_crop,
-        nose_box
+    route = validate_and_route_input(
+        image
     )
 
-    if nose_crop is None:
+    input_type = route["input_type"]
+
+    if input_type == "INVALID":
 
         print(
-            "RESULT: NOSE CROP FAILED"
+            f"Validation result: "
+            f"{route['nose_validation']} "
+            f"(confidence="
+            f"{route['nose_validation_confidence']:.4f})"
+        )
+
+        print(
+            "RESULT: INVALID_INPUT"
         )
 
         return False
 
-    nose_crop_path = (
-        output_dir /
-        "nose_crop.jpg"
-    )
+    if input_type == "FULL_DOG":
 
-    cv2.imwrite(
-        str(nose_crop_path),
-        nose_crop
-    )
+        print(
+            "Validation result: FULL_DOG"
+        )
 
-    print(
-        f"Nose crop saved: "
-        f"{nose_crop.shape[1]} x "
-        f"{nose_crop.shape[0]}"
-    )
+        print(
+            f"Dog face confidence: "
+            f"{route['face_confidence']:.2f}"
+        )
 
-    # --------------------------------------------------------
-    # STEP 4: ENHANCEMENT
-    # --------------------------------------------------------
+    elif input_type == "DOG_NOSE":
+
+        print(
+            "Validation result: DOG_NOSE"
+        )
+
+        print(
+            f"Nose validation confidence: "
+            f"{route['nose_validation_confidence']:.4f}"
+        )
+
+    # ========================================================
+    # FULL DOG PATH
+    # ========================================================
+
+    if input_type == "FULL_DOG":
+
+        # ----------------------------------------------------
+        # STEP 3
+        # CROP DOG FACE
+        # ----------------------------------------------------
+
+        print()
+        print(
+            "[3/6] Cropping dog face..."
+        )
+
+        face_crop = crop_face(
+            image,
+            route["face_box"]
+        )
+
+        if face_crop is None:
+
+            print(
+                "RESULT: FACE_CROP_FAILED"
+            )
+
+            return False
+
+        face_path = (
+            output_dir
+            / "face_crop.jpg"
+        )
+
+        cv2.imwrite(
+            str(face_path),
+            face_crop
+        )
+
+        print(
+            f"Face crop saved: "
+            f"{face_crop.shape[1]} x "
+            f"{face_crop.shape[0]}"
+        )
+
+        # ----------------------------------------------------
+        # STEP 4
+        # NOSE DETECTION + CROP
+        # ----------------------------------------------------
+
+        print()
+        print(
+            "[4/6] Detecting and "
+            "cropping nose..."
+        )
+
+        (
+            nose_box,
+            nose_confidence,
+            nose_model
+        ) = detect_nose(
+            face_crop
+        )
+
+        if nose_box is None:
+
+            print(
+                "RESULT: "
+                "DOG_FACE_DETECTED_BUT_"
+                "NOSE_NOT_FOUND"
+            )
+
+            return False
+
+        print(
+            f"Nose detected using "
+            f"{nose_model} "
+            f"(confidence="
+            f"{nose_confidence:.2f})"
+        )
+
+        nose_crop = crop_nose_v3(
+            face_crop,
+            nose_box
+        )
+
+        if nose_crop is None:
+
+            print(
+                "RESULT: NOSE_CROP_FAILED"
+            )
+
+            return False
+
+        nose_crop_path = (
+            output_dir
+            / "nose_crop.jpg"
+        )
+
+        cv2.imwrite(
+            str(nose_crop_path),
+            nose_crop
+        )
+
+        print(
+            f"Nose crop saved: "
+            f"{nose_crop.shape[1]} x "
+            f"{nose_crop.shape[0]}"
+        )
+
+    # ========================================================
+    # DIRECT DOG NOSE PATH
+    # ========================================================
+
+    else:
+
+        # ----------------------------------------------------
+        # Already a dog-nose image.
+        #
+        # DO NOT crop.
+        # DO NOT run nose detector.
+        # ----------------------------------------------------
+
+        print()
+        print(
+            "[3/6] Direct dog-nose input..."
+        )
+
+        nose_crop = image.copy()
+
+        nose_crop_path = (
+            output_dir
+            / "nose_input.jpg"
+        )
+
+        cv2.imwrite(
+            str(nose_crop_path),
+            nose_crop
+        )
+
+        print(
+            "Nose cropping skipped."
+        )
+
+        print(
+            "Using uploaded image directly."
+        )
+
+    # ========================================================
+    # STEP 5
+    # ENHANCEMENT
+    # ========================================================
 
     print()
     print(
-        "[4/6] Enhancing nose..."
+        "[5/6] Enhancing nose..."
     )
 
     enhanced_nose = enhance_nose(
@@ -1235,8 +1561,8 @@ def run_pipeline(
     )
 
     enhanced_path = (
-        output_dir /
-        "nose_enhanced.png"
+        output_dir
+        / "nose_enhanced.png"
     )
 
     cv2.imwrite(
@@ -1248,13 +1574,15 @@ def run_pipeline(
         "Enhanced image: 224 x 224"
     )
 
-    # --------------------------------------------------------
-    # STEP 5: RESNET50
-    # --------------------------------------------------------
+    # ========================================================
+    # STEP 6
+    # RESNET50 + SAVE FEATURE
+    # ========================================================
 
     print()
     print(
-        "[5/6] Extracting ResNet50 features..."
+        "[6/6] Extracting "
+        "ResNet50 features..."
     )
 
     features = extract_features(
@@ -1266,18 +1594,9 @@ def run_pipeline(
         f"{features.shape}"
     )
 
-    # --------------------------------------------------------
-    # STEP 6: SAVE FEATURE VECTOR
-    # --------------------------------------------------------
-
-    print()
-    print(
-        "[6/6] Saving 2048-D feature..."
-    )
-
     feature_path = (
-        output_dir /
-        "feature_2048.npy"
+        output_dir
+        / "feature_2048.npy"
     )
 
     np.save(
@@ -1285,36 +1604,61 @@ def run_pipeline(
         features[0]
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # FINAL RESULT
-    # --------------------------------------------------------
+    # ========================================================
 
     print()
     print("=" * 70)
     print(
-        "             PIPELINE COMPLETE"
+        "                 PIPELINE COMPLETE"
     )
     print("=" * 70)
 
     print()
     print(
-        f"Input image       : {input_path}"
+        f"Input image       : "
+        f"{input_path}"
     )
 
     print(
-        f"Face confidence   : "
-        f"{face_confidence:.2f}"
+        f"Quality score     : "
+        f"{quality_score:.2f}"
     )
 
     print(
-        f"Nose detector     : "
-        f"{nose_model}"
+        f"Input type        : "
+        f"{input_type}"
     )
 
-    print(
-        f"Nose confidence   : "
-        f"{nose_confidence:.2f}"
-    )
+    if input_type == "FULL_DOG":
+
+        print(
+            f"Face confidence   : "
+            f"{route['face_confidence']:.2f}"
+        )
+
+        print(
+            f"Nose detector     : "
+            f"{nose_model}"
+        )
+
+        print(
+            f"Nose confidence   : "
+            f"{nose_confidence:.2f}"
+        )
+
+    else:
+
+        print(
+            f"Nose validation   : "
+            f"{route['nose_validation']}"
+        )
+
+        print(
+            f"Nose confidence   : "
+            f"{route['nose_validation_confidence']:.4f}"
+        )
 
     print(
         f"Feature shape     : "
@@ -1323,7 +1667,7 @@ def run_pipeline(
 
     print()
     print(
-        f"Results saved to:"
+        "Results saved to:"
     )
 
     print(
@@ -1349,12 +1693,9 @@ if __name__ == "__main__":
     if len(sys.argv) != 2:
 
         print()
+        print("Usage:")
         print(
-            "Usage:"
-        )
-
-        print(
-            r'python src\pipeline\run_pipeline.py "path\to\dog.jpg"'
+            r'python src\pipeline\run_pipeline.py "path\to\image.jpg"'
         )
 
         sys.exit(1)
